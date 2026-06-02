@@ -38,6 +38,11 @@ pending_duplicate = {}   # kullanıcı -> mükerrer kart kontrolü
 balance_queue = asyncio.Queue()   # balance işlemleri kuyruğu
 balance_busy = False
 
+# Debounce / birleştirme: büyük yapıştırmaları birkaç kısa mesaj halinde gelen
+# parçaları birleştirip kullanıcıya tek seferde seçim sormak için.
+user_timers = {}        # uid -> asyncio.Task
+DEBOUNCE_SECONDS = 3
+
 # Basit hafıza (daha önce sorgulanan kartlar)
 MEMORY_FILE = "kubur_memory.json"
 
@@ -55,14 +60,16 @@ memory = load_memory()
 
 # ---------------------------- YARDIMCILAR ----------------------------
 def card_parser(text):
-    """Kart formatını algıla: 16 hane|AA|YYYY|CVV veya benzeri"""
+    """Mesaj içindeki tüm kartları algıla ve liste döndür: num|MM|YYYY|CVV"""
     pattern = r'(\d{15,16})[\s:/|\\,.-]+(\d{2})[\s:/|\\,.-]+(\d{2,4})(?:[\s:/|\\,.-]+(\d{3,4}))?'
-    match = re.search(pattern, text)
-    if match:
-        num, month, year, cvv = match.groups()
+    matches = re.findall(pattern, text)
+    results = []
+    for match in matches:
+        num, month, year, cvv = match
         year = "20" + year[-2:]
-        return f"{num}|{month}|{year}|{cvv}" if cvv else f"{num}|{month}|{year}"
-    return None
+        parsed = f"{num}|{month}|{year}|{cvv}" if cvv else f"{num}|{month}|{year}"
+        results.append(parsed)
+    return results if results else None
 
 async def bin_sorgula(kart_no):
     """BIN bilgisi al (basit)"""
@@ -173,6 +180,27 @@ async def balance_worker():
             balance_busy = False
             balance_queue.task_done()
 
+
+async def debounce_send_prompt(uid, username):
+    try:
+        await asyncio.sleep(DEBOUNCE_SECONDS)
+        # eğer kullanıcı zaten seçim aşamasındaysa prompt atma
+        if uid in user_tasks:
+            return
+        # eğer kart yoksa bir şey yapma
+        cards = pending_cards.get(uid, [])
+        if not cards:
+            return
+        user_tasks[uid] = True
+        # promptu hedef grupta atıyoruz, kullanıcı adıyla belirt
+        await client.send_message(TARGET_GROUP_ID, f"📦 @{username} {len(cards)} kart toplandı.\n1️⃣ Raven (hızlı sorgu)\n2️⃣ Balance (bakiye)\nSeçiminizi yapın (1/2):")
+    except Exception:
+        return
+    finally:
+        # timer görevini temizle
+        if uid in user_timers:
+            user_timers.pop(uid, None)
+
 # ---------------------------- KART TOPLAMA VE SEÇİM ----------------------------
 @client.on(events.NewMessage(chats=TARGET_GROUP_ID))
 async def target_handler(event):
@@ -187,26 +215,41 @@ async def target_handler(event):
             del user_tasks[uid]
         if uid in pending_cards:
             del pending_cards[uid]
+        # iptal edildiyse debounce timerı da iptal et
+        if uid in user_timers:
+            try:
+                user_timers[uid].cancel()
+            except Exception:
+                pass
+            user_timers.pop(uid, None)
         await event.reply("🚫 İşleminiz iptal edildi.")
         return
 
-    # Kart parse et
-    parsed = card_parser(text)
-    if parsed:
-        kart_no = parsed.split('|')[0]
-        # Daha önce sorgulanmış mı?
-        if kart_no in memory:
-            await event.reply(f"⚠️ `{kart_no}` daha önce sorgulanmış: {memory[kart_no]}\nDevam etmek için 'devam' yazın, iptal için '.iptal'")
-            pending_duplicate[uid] = {'card': parsed, 'username': username}
-            return
-        # Kartları topla
+    # Kart parse et (tüm kartları yakala)
+    parsed_list = card_parser(text)
+    if parsed_list:
         if uid not in pending_cards:
             pending_cards[uid] = []
-        pending_cards[uid].append(parsed)
-        # Kullanıcıya seçenekleri sor (eğer daha önce sorulmadıysa)
-        if uid not in user_tasks:
-            user_tasks[uid] = True
-            await event.reply(f"📦 {len(pending_cards[uid])} kart toplandı.\n1️⃣ Raven (hızlı sorgu)\n2️⃣ Balance (bakiye)\nSeçiminizi yapın (1/2):")
+        for parsed in parsed_list:
+            kart_no = parsed.split('|')[0]
+            # Daha önce sorgulanmış mı?
+            if kart_no in memory:
+                await event.reply(f"⚠️ `{kart_no}` daha önce sorgulanmış: {memory[kart_no]}\nDevam etmek için 'devam' yazın, iptal için '.iptal'")
+                pending_duplicate[uid] = {'card': parsed, 'username': username}
+                continue
+            pending_cards[uid].append(parsed)
+        # Yeni kart mesajı geldi, varsa önceki debounce'i iptal et ve yenisini başlat
+        if uid in user_timers:
+            try:
+                user_timers[uid].cancel()
+            except Exception:
+                pass
+            user_timers.pop(uid, None)
+        # Kısa bir süre (DEBOUNCE_SECONDS) bekleyip gelen tüm parçalar tamamlandığında
+        # tek seferde seçim soracak görev başlat
+        user_timers[uid] = asyncio.create_task(debounce_send_prompt(uid, username))
+        # küçük bir geri bildirim ver
+        await event.reply(f"🧩 Parçalar alındı, birleştiriliyor... Lütfen birkaç saniye bekleyin.")
     elif text.lower().startswith("devam") and uid in pending_duplicate:
         job = pending_duplicate.pop(uid)
         if uid not in pending_cards:
@@ -218,6 +261,13 @@ async def target_handler(event):
         await event.reply(f"📦 {len(pending_cards[uid])} kart toplandı.\n1️⃣ Raven\n2️⃣ Balance\nSeçiminiz:")
     elif text in ["1", "2"] and uid in user_tasks:
         # Seçim yapıldı
+        # eğer bir debounce timer'ı varsa iptal et
+        if uid in user_timers:
+            try:
+                user_timers[uid].cancel()
+            except Exception:
+                pass
+            user_timers.pop(uid, None)
         del user_tasks[uid]
         cards = pending_cards.pop(uid, [])
         if not cards:
