@@ -10,6 +10,9 @@ import logging
 from datetime import datetime
 from telethon import TelegramClient, events, errors
 
+# Basit logging
+logging.basicConfig(level=logging.INFO)
+
 # ---------------------------- KONFIG ----------------------------
 API_ID = int(os.environ.get("API_ID", 31924590))
 API_HASH = os.environ.get("API_HASH", '5c22bfad88d4ef054ac7eab21ecaf1b5')
@@ -133,7 +136,8 @@ async def process_balance(cards, user, amount):
         if kart_no in memory:
             await client.send_message(TARGET_GROUP_ID, f"♻️ @{user}, `{kart_no}` daha önce sorgulanmış: {memory[kart_no]}")
             continue
-        res = await wait_for_response(client, "", f"{card} {amount}", BALANCE_BOT, 35)
+        # Balance bot expects a command prefix; send with /check
+        res = await wait_for_response(client, "/check", f"{card} {amount}", BALANCE_BOT, 35)
         res_text = res if res else "TIMEOUT"
         results.append(f"{card} | {res_text}")
         memory[kart_no] = res_text[:100]
@@ -241,19 +245,28 @@ async def target_handler(event):
 
 # ---------------------------- MAIN ----------------------------
 async def main():
-    await client.start()
-    me = await client.get_me()
-    print(f"✅ Bot başlatıldı: {me.first_name} (@{me.username})")
-    print(f"📌 Hedef grup ID: {TARGET_GROUP_ID}")
-    asyncio.create_task(balance_worker())
-    await client.run_until_disconnected()
+    try:
+        BOT_TOKEN = os.environ.get('BOT_TOKEN')
+        if BOT_TOKEN:
+            await client.start(bot_token=BOT_TOKEN)
+        else:
+            await client.start()
+        me = await client.get_me()
+        logging.info(f"✅ Bot başlatıldı: {me.first_name} (@{me.username})")
+        logging.info(f"📌 Hedef grup ID: {TARGET_GROUP_ID}")
+        asyncio.create_task(balance_worker())
+        await client.run_until_disconnected()
+    except Exception:
+        logging.exception("Başlatma hatası")
 
 if __name__ == '__main__':
-    loop = asyncio.get_event_loop()
     try:
-        loop.run_until_complete(main())
+        asyncio.run(main())
     except KeyboardInterrupt:
         print("Kapatılıyor...")
     finally:
-        if client.is_connected():
-            loop.run_until_complete(client.disconnect())
+        try:
+            if client.is_connected():
+                asyncio.run(client.disconnect())
+        except Exception:
+            pass
