@@ -36,7 +36,9 @@ user_tasks = {}          # kullanıcı -> beklenecek işlem
 pending_cards = {}       # kullanıcı -> toplanan kart listesi
 pending_duplicate = {}   # kullanıcı -> mükerrer kart kontrolü
 balance_queue = asyncio.Queue()   # balance işlemleri kuyruğu
+raven_queue = asyncio.Queue()     # raven işlemleri kuyruğu
 balance_busy = False
+raven_busy = False
 
 # Debounce / birleştirme: büyük yapıştırmaları birkaç kısa mesaj halinde gelen
 # parçaları birleştirip kullanıcıya tek seferde seçim sormak için.
@@ -92,11 +94,17 @@ async def wait_for_response(worker_client, command, card, target_chat, timeout=9
     try:
         msg_payload = f"{command} {card}".strip() if command else card
         sent = await worker_client.send_message(target_chat, msg_payload)
+        kart_no = card.split('|')[0]  # Kart numarasını ayıkla
         start = datetime.now()
         while (datetime.now() - start).total_seconds() < timeout:
             await asyncio.sleep(2)
-            async for msg in worker_client.iter_messages(target_chat, limit=5):
-                if msg.id > sent.id and card.split('|')[0] in (msg.text or ""):
+            # Daha fazla mesajı kontrol et (20 yerine 50) ve ters sırada ara
+            async for msg in worker_client.iter_messages(target_chat, limit=50):
+                # Mesaj gönderimizden sonra mı?
+                if msg.id <= sent.id:
+                    continue
+                # Mesajda kart numarası var mı ve metni boş değil mi?
+                if msg.text and kart_no in msg.text:
                     return msg.text
         return "TIMEOUT"
     except errors.FloodWaitError as e:
@@ -134,6 +142,26 @@ async def process_raven(cards, user):
         if len(report) > 4000:
             report = report[:4000] + "\n...(kesildi)"
         await client.send_message(TARGET_GROUP_ID, f"🏁 @{user} Raven raporu:\n```\n{report}\n```")
+
+# Raven worker - sıra sistemi
+async def raven_worker():
+    global raven_busy
+    while True:
+        if raven_busy:
+            await asyncio.sleep(1)
+            continue
+        try:
+            task = await asyncio.wait_for(raven_queue.get(), timeout=2)
+        except asyncio.TimeoutError:
+            continue
+        raven_busy = True
+        try:
+            await process_raven(task['cards'], task['user'])
+        except Exception as e:
+            await client.send_message(TARGET_GROUP_ID, f"❌ Raven hatası: {e}")
+        finally:
+            raven_busy = False
+            raven_queue.task_done()
 
 # ---------------------------- BALANCE İŞLEM ----------------------------
 async def process_balance(cards, user, amount):
@@ -274,7 +302,13 @@ async def target_handler(event):
             await event.reply("❌ Kart bulunamadı.")
             return
         if text == "1":
-            asyncio.create_task(process_raven(cards, username))
+            # Raven'a kuyruğa al
+            task_data = {
+                'cards': cards,
+                'user': username
+            }
+            await raven_queue.put(task_data)
+            await event.reply("✅ Raven kuyruğuna alındı. Sıranız geldiğinde işleminiz yapılacak.")
         else:  # text == "2"
             # Balance için miktar sor
             user_tasks[uid] = {'cards': cards, 'username': username, 'step': 'wait_amount'}
@@ -305,6 +339,7 @@ async def main():
         logging.info(f"✅ Bot başlatıldı: {me.first_name} (@{me.username})")
         logging.info(f"📌 Hedef grup ID: {TARGET_GROUP_ID}")
         asyncio.create_task(balance_worker())
+        asyncio.create_task(raven_worker())
         await client.run_until_disconnected()
     except Exception:
         logging.exception("Başlatma hatası")
